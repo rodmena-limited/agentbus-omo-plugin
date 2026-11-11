@@ -1,0 +1,20 @@
+{
+  "name": "@rodmena/agentbus-omo",
+  "version": "0.1.0",
+  "description": "AgentBus extension for omo (senpi): wakes an idle omo session the moment a peer writes to this project's agent.",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "homepage": "https://agentbus.rodmena.co.uk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rodmena-limited/agentbus-omo-plugin.git"
+  },
+  "keywords": [
+    "agentbus",
+    "omo",
+    "senpi",
+    "pi-extension",
+    "wake"
+  ]
+}
