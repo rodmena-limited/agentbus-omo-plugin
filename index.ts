@@ -27,6 +27,7 @@ import { dirname, join } from "node:path";
 
 const VERSION = "0.1.0";
 const HOOK_BIN = process.env.AGENTBUS_HOOK_BIN || "agentbus-hook";
+const CLI_BIN = process.env.AGENTBUS_BIN || "agentbus";
 const BASE_URL = (process.env.AGENTBUS_BASE_URL || "https://agentbus.rodmena.co.uk").replace(/\/+$/, "");
 const CONFIG_DIR = process.env.AGENTBUS_CONFIG_DIR || join(homedir(), ".config", "agentbus");
 const LOG_PATH = process.env.AGENTBUS_OMO_LOG || join(CONFIG_DIR, "omo-plugin.log");
@@ -57,13 +58,13 @@ async function log(line: string): Promise<void> {
 
 type RunResult = { code: number; stdout: string; stderr: string };
 
-function run(args: string[], env: Record<string, string>, cwd: string, stdin?: string, timeoutMs = 10_000): Promise<RunResult> {
+function run(args: string[], env: Record<string, string>, cwd: string, stdin?: string, timeoutMs = 10_000, bin = HOOK_BIN): Promise<RunResult> {
 	return new Promise((resolve) => {
 		let stdout = "";
 		let stderr = "";
 		let child: ReturnType<typeof spawn>;
 		try {
-			child = spawn(HOOK_BIN, args, { cwd, env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+			child = spawn(bin, args, { cwd, env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
 		} catch (err) {
 			resolve({ code: 127, stdout: "", stderr: String(err) });
 			return;
@@ -122,16 +123,33 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * Take the watcher lock atomically: exclusive create ("wx"), so two sessions starting
+ * together cannot both win. A lock left by a dead pid is removed and the create retried
+ * once; if that still loses, the winner holds it and this session is PASSIVE.
+ * Returns the holder pid when another live process holds the lock (0 if unreadable).
+ */
 async function acquireLock(lockPath: string): Promise<number | undefined> {
-	try {
-		const holder = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10);
-		if (holder && holder !== process.pid && pidAlive(holder)) return holder;
-	} catch {
-		/* no lock yet */
-	}
 	await mkdir(dirname(lockPath), { recursive: true });
-	await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600 });
-	return undefined;
+	let holder = 0;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
+			return undefined;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+		}
+		try {
+			holder = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10) || 0;
+		} catch {
+			continue; // released between our create and read; try the create again
+		}
+		if (holder === process.pid) return undefined;
+		if (holder && pidAlive(holder)) return holder;
+		await log(`removing stale watcher lock ${lockPath} (pid ${holder || "unreadable"} is not running)`);
+		await unlink(lockPath).catch(() => {});
+	}
+	return holder;
 }
 
 function withIdleDeadline<T>(p: Promise<T>, onExpire: () => void): Promise<T> {
@@ -356,6 +374,20 @@ export default function agentbus(pi: ExtensionAPI) {
 		catchUp = start.stdout.trim();
 
 		lockPath = join(CONFIG_DIR, `omo-watch-${agent}.lock`);
+		// A client-side watcher (Claude plugin monitor or `agentbus watch`) may already hold
+		// this agent. exit 0 free, 4 held; anything else (older client, no binary) is not a
+		// verdict, so fall through to the omo lock alone.
+		if (!streamsInProcess.has(agent)) {
+			const check = await run(["watch-check", "--agent", agent, "--harness", "omo"], hookEnv(), cwd, undefined, 10_000, CLI_BIN);
+			if (check.code === 4) {
+				state = "passive";
+				const holders = check.stdout.trim().replace(/\s*\n\s*/g, "; ");
+				await log(`a client watcher already holds ${agent} (${holders || "holder not listed"}); this one is PASSIVE`);
+				if (ctx.hasUI) ctx.ui.notify(`AgentBus: ${agent} is already watched by another client (${holders || "see agentbus watch-status"}); this session will not be woken.`, "warning");
+				return;
+			}
+			if (check.code !== 0) await log(`watch-check gave exit ${check.code} (not a verdict; checking the omo lock only): ${(check.stderr || check.stdout).trim().slice(0, 200)}`);
+		}
 		const holder = streamsInProcess.has(agent) ? process.pid : await acquireLock(lockPath);
 		if (holder !== undefined) {
 			state = "passive";
