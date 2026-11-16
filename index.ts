@@ -21,7 +21,7 @@
  */
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -123,14 +123,23 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-/** Exclusive create: true when this process made the file, false when it already existed. */
+/**
+ * Exclusive create: true when this process made the file, false when it already existed.
+ * The pid is written to a private temp file first and then link()ed onto the path, so the
+ * name never exists without its content. With open("wx") followed by a write, a reader in
+ * between would see an empty file, read it as a dead holder, and delete a live lock.
+ */
 async function createExclusive(path: string): Promise<boolean> {
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	await writeFile(tmp, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
 	try {
-		await writeFile(path, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
+		await link(tmp, path);
 		return true;
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
 		throw err;
+	} finally {
+		await unlink(tmp).catch(() => {});
 	}
 }
 
