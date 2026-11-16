@@ -123,33 +123,64 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
+/** Exclusive create: true when this process made the file, false when it already existed. */
+async function createExclusive(path: string): Promise<boolean> {
+	try {
+		await writeFile(path, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
+		return true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw err;
+	}
+}
+
+/** The pid in a lock file; undefined when the file is gone, 0 when its content is unreadable. */
+async function readPid(path: string): Promise<number | undefined> {
+	try {
+		return Number.parseInt((await readFile(path, "utf8")).trim(), 10) || 0;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Take the watcher lock atomically: exclusive create ("wx"), so two sessions starting
- * together cannot both win. A lock left by a dead pid is removed and the create retried
- * once; if that still loses, the winner holds it and this session is PASSIVE.
- * Returns the holder pid when another live process holds the lock (0 if unreadable).
+ * together cannot both win.
+ *
+ * A lock left by a dead pid is removed only by the session holding `<lock>.takeover`
+ * (itself an exclusive create), and only if the lock still names that same dead pid.
+ * Without the guard, two sessions that both judged the lock stale could each unlink it,
+ * and the second unlink would delete the first one's fresh lock.
+ * Returns the holder pid when another live process holds the lock (0 if unknown).
  */
 async function acquireLock(lockPath: string): Promise<number | undefined> {
 	await mkdir(dirname(lockPath), { recursive: true });
-	let holder = 0;
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
-			return undefined;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-		}
-		try {
-			holder = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10) || 0;
-		} catch {
-			continue; // released between our create and read; try the create again
-		}
+	const guard = `${lockPath}.takeover`;
+	let holder: number | undefined = 0;
+	for (let attempt = 0; attempt < 40; attempt++) {
+		if (await createExclusive(lockPath)) return undefined;
+		holder = await readPid(lockPath);
+		if (holder === undefined) continue; // released between our create and read
 		if (holder === process.pid) return undefined;
 		if (holder && pidAlive(holder)) return holder;
-		await log(`removing stale watcher lock ${lockPath} (pid ${holder || "unreadable"} is not running)`);
-		await unlink(lockPath).catch(() => {});
+		if (await createExclusive(guard)) {
+			try {
+				const now = await readPid(lockPath);
+				if (now === holder && !(now && pidAlive(now))) {
+					await log(`removing stale watcher lock ${lockPath} (pid ${holder || "unreadable"} is not running)`);
+					await unlink(lockPath).catch(() => {});
+				}
+			} finally {
+				await unlink(guard).catch(() => {});
+			}
+			continue;
+		}
+		// Another session is mid-takeover. A guard whose pid is dead was left by a crash.
+		const guardPid = await readPid(guard);
+		if (guardPid !== undefined && !(guardPid && pidAlive(guardPid))) await unlink(guard).catch(() => {});
+		else await new Promise((r) => setTimeout(r, 25));
 	}
-	return holder;
+	return holder ?? 0;
 }
 
 function withIdleDeadline<T>(p: Promise<T>, onExpire: () => void): Promise<T> {
